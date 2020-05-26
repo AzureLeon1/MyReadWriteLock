@@ -8,7 +8,8 @@ using System.Threading.Tasks;
 namespace MyReadWriteLock {
     class Program {
         static void Main(string[] args) {
-            var sc = new MyCache();
+            // var sc = new MyCache();
+            var sc = new MyCache2();
             var tasks = new List<Task>();
             int itemsWritten = 0;
 
@@ -63,7 +64,7 @@ namespace MyReadWriteLock {
                 for (int ctr = 1; ctr <= sc.Count; ctr++) {
                     String value = sc.Read(ctr);
                     if (value == "cucumber")
-                        if (sc.AddOrUpdate(ctr, "green bean") != MyCache.AddOrUpdateStatus.Unchanged)
+                        if (sc.AddOrUpdate(ctr, "green bean") != MyCache2.AddOrUpdateStatus.Unchanged)
                             Console.WriteLine("Changed 'cucumber' to 'green bean'");
                 }
             }));

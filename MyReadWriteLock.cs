@@ -50,7 +50,7 @@ namespace MyReadWriteLock {
         }
     }
 
-    class MyReadWriteLock : IDisposable {
+    class MyReadWriteLock {
 
         int myLock;
 
@@ -331,6 +331,9 @@ namespace MyReadWriteLock {
         }
 
         public void ExitWriteLock() {
+#if DEBUG
+            //Console.WriteLine("Debug: ExitWriteLock");
+#endif
             ReaderWriterCount lrwc;
 
             EnterMyLock();
@@ -341,10 +344,11 @@ namespace MyReadWriteLock {
                 throw new Exception("Mis match write");
             }
 
-            if (lrwc.writercount < 1) {
-                ExitMyLock();
-                throw new Exception("Mis match write");
-            }
+            
+            //if (lrwc.writercount < 1) {       // for recursive write
+            //    ExitMyLock();
+            //    throw new Exception("Mis match write");
+            //}
 
             lrwc.writercount--;
 
@@ -445,7 +449,7 @@ namespace MyReadWriteLock {
 
             if (Thread.CurrentThread.ManagedThreadId != upgradeLockOwnerId) {
                 //You have to be holding the upgrade lock to make this call.  
-                throw new SynchronizationLockException(SR.GetString(SR.SynchronizationLockException_MisMatchedUpgrade));
+                throw new Exception("Mis match upgrade");
             }
             EnterMyLock();
 
@@ -658,11 +662,6 @@ namespace MyReadWriteLock {
 
         private uint GetNumReaders() {
             return owners & READER_MASK;
-        }
-
-
-        public void Dispose() {
-            throw new NotImplementedException();
         }
     }
 }

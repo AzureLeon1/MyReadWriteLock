@@ -44,7 +44,9 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="MyCache.cs" />
+    <Compile Include="MyCache2.cs" />
     <Compile Include="MyReadWriteLock.cs" />
+    <Compile Include="MyReadWriteLock2.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
