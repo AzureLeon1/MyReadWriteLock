@@ -110,6 +110,8 @@ namespace MyReadWriteLock {
             writeLockOwnerId = -1;
         }
 
+
+        /****************** read lock **********************/
         public void EnterReadLock() {
             TryEnterReadLock(-1);
         }
@@ -199,6 +201,315 @@ namespace MyReadWriteLock {
             return retVal;
         }
 
+        public void ExitReadLock() {
+            ReaderWriterCount lrwc = null;
+            EnterMyLock();
+            lrwc = GetThreadRWCount(true);
+            if (lrwc == null || lrwc.readercount < 1) {
+                ExitMyLock();
+                throw new Exception("mis match read");
+            }
+
+            --owners;
+            lrwc.readercount--;
+            ExitAndWakeUpAppropriateWaiters();    // 唤醒合适的waiters
+        }
+
+        /****************** write lock **********************/
+        public void EnterWriteLock() {
+            TryEnterWriteLock(-1);
+        }
+        public bool TryEnterWriteLock(int millisecondsTimeout) {
+            return TryEnterWriteLock(new TimeoutTracker(millisecondsTimeout));
+        }
+
+        private bool TryEnterWriteLock(TimeoutTracker timeout) {
+            bool result = false;
+            try {
+                result = TryEnterWriteLockCore(timeout);
+            }
+            finally { }
+            return result;
+        }
+
+        private bool TryEnterWriteLockCore(TimeoutTracker timeout) {
+
+            int id = Thread.CurrentThread.ManagedThreadId;
+            ReaderWriterCount lrwc;
+            bool upgradingToWrite = false;
+
+            if (id == writeLockOwnerId) {      //  不允许循环重入写
+                //Check for AW->AW  
+                throw new Exception("Not allow recursive write");
+            }
+            else if (id == upgradeLockOwnerId) {     // 允许可升级读锁升级为写锁
+                //AU->AW case is allowed once.  
+                upgradingToWrite = true;
+            }
+
+            EnterMyLock();
+            lrwc = GetThreadRWCount(true);
+
+            //Can't acquire write lock with reader lock held.  
+            if (lrwc != null && lrwc.readercount > 0) {
+                ExitMyLock();
+                throw new Exception("Not allow write after read");
+            }
+
+            int spincount = 0;
+            bool retVal = true;
+            for (; ; ) {
+                if (IsWriterAcquired()) {
+                    // Good case, there is no contention, we are basically done  
+                    SetWriterAcquired();
+                    break;
+                }
+
+                //Check if there is just one upgrader, and no readers.Assumption: Only one thread can have the upgrade lock, so the following check will fail for all other threads that may sneak in when the upgrading thread is waiting.  
+
+                if (upgradingToWrite) {
+                    uint readercount = GetNumReaders();
+                    if (readercount == 1) {
+                        //Good case again, there is just one upgrader, and no readers.  
+                        SetWriterAcquired(); // indicate we have a writer.  
+                        break;
+                    }
+                    else if (readercount == 2) {
+                        if (lrwc != null) {
+                            if (IsRwHashEntryChanged(lrwc))
+                                lrwc = GetThreadRWCount(false);
+
+                            if (lrwc.readercount > 0) {
+                                //Good case again, there is just one upgrader, and no readers.  
+                                SetWriterAcquired(); // indicate we have a writer.  
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (spincount < MaxSpinCount) {   // 在timeout内竞争等待
+                    ExitMyLock();
+                    if (timeout.IsExpired)
+                        return false;
+                    spincount++;
+                    Thread.SpinWait(spincount);
+                    EnterMyLock();
+                    continue;
+                }
+
+                if (upgradingToWrite) {           // 可升级读升级为写，等待
+                    if (waitUpgradeEvent == null) // Create the needed event  
+                    {
+                        LazyCreateEvent(ref waitUpgradeEvent, true);
+                        continue; // since we left the lock, start over.  
+                    }
+                    retVal = WaitOnEvent(waitUpgradeEvent, ref numWriteUpgradeWaiters, timeout);
+
+                    //The lock is not held in case of failure.  
+                    if (!retVal)
+                        return false;
+                }
+                else {                           // 写者等待
+                    // Drat, we need to wait.  Mark that we have waiters and wait.  
+                    if (writeEvent == null) // create the needed event.  
+                    {
+                        LazyCreateEvent(ref writeEvent, true);
+                        continue; // since we left the lock, start over.  
+                    }
+
+                    retVal = WaitOnEvent(writeEvent, ref numWriteWaiters, timeout);
+                    //The lock is not held in case of failure.  
+                    if (!retVal)
+                        return false;
+                }
+            }
+
+            ExitMyLock();
+            writeLockOwnerId = id;
+            return true;
+        }
+
+        public void ExitWriteLock() {
+            ReaderWriterCount lrwc;
+
+            EnterMyLock();
+            lrwc = GetThreadRWCount(false);
+
+            if (lrwc == null) {
+                ExitMyLock();
+                throw new Exception("Mis match write");
+            }
+
+            if (lrwc.writercount < 1) {
+                ExitMyLock();
+                throw new Exception("Mis match write");
+            }
+
+            lrwc.writercount--;
+
+            if (lrwc.writercount > 0) {
+                ExitMyLock();
+                return;
+            }
+
+            ClearWriterAcquired();
+
+            writeLockOwnerId = -1;
+
+            ExitAndWakeUpAppropriateWaiters();  // 唤醒
+        }
+
+        /****************** upgradeable read lock **********************/
+        public void EnterUpgradeableReadLock() {
+            TryEnterUpgradeableReadLock(-1);
+        }
+
+        public bool TryEnterUpgradeableReadLock(int millisecondsTimeout) {
+            return TryEnterUpgradeableReadLock(new TimeoutTracker(millisecondsTimeout));
+        }
+
+        private bool TryEnterUpgradeableReadLock(TimeoutTracker timeout) {
+            bool result = false;
+            try {
+                result = TryEnterUpgradeableReadLockCore(timeout);
+            }
+            finally { }
+            return result;
+        }
+
+        private bool TryEnterUpgradeableReadLockCore(TimeoutTracker timeout) {
+
+            int id = Thread.CurrentThread.ManagedThreadId;
+            ReaderWriterCount lrwc;
+
+            if (id == upgradeLockOwnerId) {
+                //Check for AU->AU  
+                throw new Exception("Not allow recursive upgrade");
+            }
+            else if (id == writeLockOwnerId) {
+                //Check for AU->AW  
+                throw new Exception("Not allow upgrade after write");
+            }
+
+            EnterMyLock();
+            lrwc = GetThreadRWCount(true);
+            //Can't acquire upgrade lock with reader lock held.  
+            if (lrwc != null && lrwc.readercount > 0) {
+                ExitMyLock();
+                throw new Exception("Not allow upgrade after read");
+            }
+
+            bool retVal = true;
+            int spincount = 0;
+
+            for (; ; ) {
+                //Once an upgrade lock is taken, it's like having a reader lock held  
+                //until upgrade or downgrade operations are performed.  
+
+                if ((upgradeLockOwnerId == -1) && (owners < MAX_READER)) {
+                    owners++;
+                    upgradeLockOwnerId = id;
+                    break;
+                }
+
+                if (spincount < MaxSpinCount) {
+                    ExitMyLock();
+                    if (timeout.IsExpired)
+                        return false;
+                    spincount++;
+                    Thread.SpinWait(spincount);
+                    EnterMyLock();
+                    continue;
+                }
+
+                // Drat, we need to wait.  Mark that we have waiters and wait.  
+                if (upgradeEvent == null) // Create the needed event  
+                {
+                    LazyCreateEvent(ref upgradeEvent, true);
+                    continue; // since we left the lock, start over.  
+                }
+
+                //Only one thread with the upgrade lock held can proceed.  
+                retVal = WaitOnEvent(upgradeEvent, ref numUpgradeWaiters, timeout);
+                if (!retVal)
+                    return false;
+            }
+
+            ExitMyLock();
+            return true;
+        }
+
+        public void ExitUpgradeableReadLock() {
+            ReaderWriterCount lrwc;
+
+            if (Thread.CurrentThread.ManagedThreadId != upgradeLockOwnerId) {
+                //You have to be holding the upgrade lock to make this call.  
+                throw new SynchronizationLockException(SR.GetString(SR.SynchronizationLockException_MisMatchedUpgrade));
+            }
+            EnterMyLock();
+
+            owners--;
+            upgradeLockOwnerId = -1;
+
+            ExitAndWakeUpAppropriateWaiters();   // 唤醒
+        }
+
+
+
+        /****************** wake up **********************/
+        /// <summary>
+        /// 唤醒
+        /// </summary>
+        private void ExitAndWakeUpAppropriateWaiters() {
+            if (fNoWaiters) {
+                ExitMyLock();
+                return;
+            }
+            ExitAndWakeUpAppropriateWaitersPreferringWriters();   // 唤醒，优先唤醒写者
+        }
+
+        /// <summary>
+        /// 唤醒，优先唤醒写者
+        /// </summary>
+        private void ExitAndWakeUpAppropriateWaitersPreferringWriters() {
+            bool setUpgradeEvent = false;
+            bool setReadEvent = false;
+            uint readercount = GetNumReaders();
+
+            if (readercount == 1 && numWriteUpgradeWaiters > 0) {  // 只有一个读者正在读，且这个读者待升级，则让这个读者升级
+                //We have to be careful now, as we are droppping the lock. No new writes should be allowed to sneak in if an upgrade was pending.  
+                ExitMyLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
+                waitUpgradeEvent.Set(); // release all upgraders (however there can be at most one).  
+            }
+            else if (readercount == 0 && numWriteWaiters > 0) {    // 没有读者在读了，但有等待的写者，则释放一个写者
+                ExitMyLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
+                writeEvent.Set(); // release one writer.  
+            }
+            else if (readercount >= 0) {                           // 正在读的读者 >= 0
+                if (numReadWaiters != 0 || numUpgradeWaiters != 0) {    // 有等待的普通读者，或有等待的可升级读者
+                    if (numReadWaiters != 0)                            // 有等待的普通读者，释放读者
+                        setReadEvent = true;
+
+                    if (numUpgradeWaiters != 0 && upgradeLockOwnerId == -1) {   // 如果有等待的可升级读者，且暂时没有可升级读者在读
+                        setUpgradeEvent = true;
+                    }
+
+                    ExitMyLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
+
+                    if (setReadEvent)
+                        readEvent.Set(); // release all readers.    // 释放所有普通读者
+
+                    if (setUpgradeEvent)
+                        upgradeEvent.Set(); //release one upgrader.   // 释放一个可升级读者
+                }
+                else
+                    ExitMyLock();
+            }
+            else
+                ExitMyLock();
+        }
+
         private void EnterMyLock() {
             if (Interlocked.CompareExchange(ref myLock, 1, 0) != 0)
                 EnterMyLockSpin();
@@ -227,6 +538,7 @@ namespace MyReadWriteLock {
             Debug.Assert(myLock != 0, "Exiting spin lock that is not held");
             Volatile.Write(ref myLock, 0);
         }
+
         /// DontAllocate is set to true if the caller just wants to get an existing entry for this thread, but doesn't want to add one if an existing one could not be found.  
         private ReaderWriterCount GetThreadRWCount(bool dontAllocate) {
             ReaderWriterCount rwc = t_rwc;
