@@ -16,7 +16,7 @@ namespace MyReadWriteLock2 {
     }
 
     //
-    // ReaderWriterCount tracks how many of each kind of lock is held by each thread.
+    // ThreadLockNode tracks how many of each kind of lock is held by each thread.
     // We keep a linked list for each thread, attached to a ThreadStatic field.
     // These are reused wherever possible, so that a given thread will only
     // allocate N of these, where N is the maximum number of locks held simultaneously
@@ -35,7 +35,7 @@ namespace MyReadWriteLock2 {
         public int readercount;
 
         // Ditto for writer/upgrader counts.  These are only used if the lock allows recursion.
-        // But we have to have the fields on every ReaderWriterCount instance, because 
+        // But we have to have the fields on every ThreadLockNode instance, because 
         // we reuse it for different locks.
         public int writercount;
         public int upgradecount;
@@ -83,12 +83,12 @@ namespace MyReadWriteLock2 {
         private EventWaitHandle _upgradeEvent; // thread waiting to acquire the upgrade lock
         private EventWaitHandle _waitUpgradeEvent; // thread waiting to upgrade from the upgrade lock to a write lock go here (at most one)
 
-        // Every lock instance has a unique ID, which is used by ReaderWriterCount to associate itself with the lock
+        // Every lock instance has a unique ID, which is used by ThreadLockNode to associate itself with the lock
         // without holding a reference to it.
         private static long s_nextLockID;
         private long _lockID;
 
-        // See comments on ReaderWriterCount.
+        // See comments on ThreadLockNode.
         [ThreadStatic]
         private static ReaderWriterCount t_rwc;
 
@@ -1019,7 +1019,7 @@ namespace MyReadWriteLock2 {
                 if (_numWriteUpgradeWaiters == 0)
                     ClearUpgraderWaiting();
 
-                if (!waitSuccessful) // We may also be about to throw for some reason.  Exit myLock.
+                if (!waitSuccessful) // We may also be about to throw for some reason.  Exit inter_span_lock.
                 {
                     if (enterLockType >= EnterLockType.Write) {
                         // Write waiters block read waiters from acquiring the lock. Since this was the last write waiter, try
