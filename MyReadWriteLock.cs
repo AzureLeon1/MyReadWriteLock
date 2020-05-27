@@ -148,7 +148,7 @@ namespace MyReadWriteLock {
             }
             else if (id == upgradeLockOwnerId) {
                 //The upgrade lock is already held.Update the global read counts and exit.  
-
+                // 降级，可以直接拿到锁
                 lrwc.readercount++;
                 owners++;
                 ExitMyLock();
