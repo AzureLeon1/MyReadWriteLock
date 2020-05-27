@@ -8,38 +8,47 @@ using System.Threading.Tasks;
 
 namespace MyReadWriteLock {
 
-    enum ThreadLockStatus { UNLOCK, READING, WRITING };
+    /// <summary>
+    /// 某个线程对于某个读写锁的状态：未获取该锁、以获取读锁、以获取写锁
+    /// </summary>
+    public enum ThreadLockStatus { UNLOCK, READING, WRITING };
 
+    /// <summary>
+    /// 线程相关的读写锁链表，链表中的每个节点对应一个读写锁
+    /// </summary>
     internal class ThreadLockNode {
         public long lock_id;
         public ThreadLockStatus status;
         public ThreadLockNode next;
     }
 
+    /// <summary>
+    /// 实现请求读写锁的超时行为
+    /// </summary>
     internal class TimeoutTracker {
-        private int m_total;
-        private int m_start;
+        private int ms_total;
+        private int ms_start;
 
-        public TimeoutTracker(int millisecondsTimeout) {
-            if (millisecondsTimeout < -1)
-                throw new ArgumentOutOfRangeException("millisecondsTimeout");
-            m_total = millisecondsTimeout;
-            if (m_total != -1 && m_total != 0)
-                m_start = Environment.TickCount;
+        public TimeoutTracker(int ms_timeout) {
+            if (ms_timeout < -1)
+                throw new ArgumentOutOfRangeException("ms_timeout");
+            ms_total = ms_timeout;
+            if (ms_total != -1 && ms_total != 0)
+                ms_start = Environment.TickCount;
             else
-                m_start = 0;
+                ms_start = 0;
         }
 
         public int RemainingMilliseconds {
             get {
-                if (m_total == -1 || m_total == 0)
-                    return m_total;
+                if (ms_total == -1 || ms_total == 0)
+                    return ms_total;
 
-                int elapsed = Environment.TickCount - m_start;
+                int elapsed = Environment.TickCount - ms_start;
                 // elapsed may be negative if TickCount has overflowed by 2^31 milliseconds.  
-                if (elapsed < 0 || elapsed >= m_total)
+                if (elapsed < 0 || elapsed >= ms_total)
                     return 0;
-                return m_total - elapsed;
+                return ms_total - elapsed;
             }
         }
 
@@ -50,74 +59,105 @@ namespace MyReadWriteLock {
         }
     }
 
+    /// <summary>
+    /// 读写锁
+    /// </summary>
     class MyReadWriteLock {
 
+        /****************** 内部轻量级自旋锁 **************************/
+        // 自旋锁信号量，1表示锁定，0表示解锁，利用互锁函数组进行操作
         int inter_span_lock;
 
-        //The variables controlling spinning behavior of Mylock(which is a spin-lock)  自旋行为
-        const int LockSpinCycles = 20;
-        const int LockSpinCount = 10;
-        const int LockSleep0Count = 5;
+        // 自旋行为
+        const int Lockspin_count = 10;    // 自旋次数
+        const int LockSpinCycles = 20;   // 自旋圈数
+        const int LockSleep0Count = 5;   // sleep(0)次数
+        /************************************************************/
 
-        // These variables allow use to avoid Setting events (which is expensive) if we don't have to.  
-        uint numWriteWaiters; // maximum number of threads that can be doing a WaitOne on the writeEvent  
-        uint numReadWaiters; // maximum number of threads that can be doing a WaitOne on the readEvent  
-        uint numWriteUpgradeWaiters; // maximum number of threads that can be doing a WaitOne on the upgradeEvent (at most 1).  
-        uint numUpgradeWaiters;
+        /************ 控制对锁处于自旋等待状态的自旋行为 ***********/
+        private const int Maxspin_count = 20;
+        /********************************************************/
 
-        //Variable used for quick check when there are no waiters.  
-        bool fNoWaiters;
 
-        int upgradeLockOwnerId;
-        int writeLockOwnerId;
+        /*********** 维护对锁处于 Event 等待状态的线程（不包括自旋等待状态的线程） ***********/
+        // 线程进行 Event 等待需要的事件，readEvent是 ManualResetEvent，同时唤醒所有读者，其他的是AutoResetEvent，每次只唤醒一个等待者
+        EventWaitHandle writeEvent;        // 线程等待获取写锁
+        EventWaitHandle readEvent;         // 线程等待获取读锁（同时唤醒所有读者）
+        EventWaitHandle upgradeEvent;      // 线程等待获取可升级读锁
+        EventWaitHandle waitUpgradeEvent;  // 线程等待从可升级读状态下获取写锁
 
-        // conditions we wait on.  
-        EventWaitHandle writeEvent; // threads waiting to acquire a write lock go here.  
-        EventWaitHandle readEvent; // threads waiting to acquire a read lock go here (will be released in bulk)  
-        EventWaitHandle upgradeEvent; // thread waiting to acquire the upgrade lock  
-        EventWaitHandle waitUpgradeEvent; // thread waiting to upgrade from the upgrade lock to a write lock go here (at most one)  
+        // 各类等待线程的数量（只包括事件等待的线程，即设置了Event的线程，不包括自旋等待的线程）
+        uint numWriteWaiters;        // 等待中的写者数  
+        uint numReadWaiters;         // 等待中的读者数
+        uint numWriteUpgradeWaiters; // 等待升级的可升级读者数（最大是1）   等待升级
+        uint numUpgradeWaiters;      // 等待中的可升级读者数              等待开始读取
 
-        // Every lock instance has a unique ID, which is used by ThreadLockNode to associate itself with the lock  
-        // without holding a reference to it.  
-        // 每个锁实例都有一个唯一的ID，ReaderWriterCount使用该ID将自身与锁相关联，而不保留对其的引用。
-        static long s_nextLockID;
-        long lockID;
+        // 方便快速查询，当上面4个num都是0时，该flag值为true
+        bool flag_no_waiters;
+        /************************************************************/
 
-        // See comments on ThreadLockNode.  
+
+        /****************** 每个线程需要维护的读写锁链表 **************************/
+        // 每个线程拥有一个链表，链表记录了该线程相关的读写锁，每个节点对应一个读写锁
         [ThreadStatic]
-        static ThreadLockNode t_rwc;
+        static ThreadLockNode thread_tln;
 
-        private const int MaxSpinCount = 20;
+        long lock_id;   // 在 ThreadLockNode 中记录读写锁的id，从而避免 ThreadLockNode 保存每个读写锁的引用
+        static long lock_id_incrementor;  // lock_id 自动递增器，每次创建一个读写锁实例，用互锁函数族进行+1操作
+        /**********************************************************************/
 
-        // 32位分成四部分： 1+1+1+29
-        uint owners;
 
+        /***************** 锁的共享变量 **********************/
+        // 写锁、可升级读锁的所属线程的id，如果没有则为-1
+        int upgrade_lock_thread_id;
+        int write_lock_thread_id;
+
+        // 32位分成四部分： 1+1+1+29 （详见文档）
+        uint thread_count;
+
+        // 操作thread_count需要的掩码
         private const uint WRITER_HELD = 0x80000000;
         private const uint WAITING_WRITERS = 0x40000000;
         private const uint WAITING_UPGRADER = 0x20000000;
 
+        // 读者数量上限，-2是为了运算时防溢出
         private const uint MAX_READER = 0x10000000 - 2;
         private const uint READER_MASK = 0x10000000 - 1;
+        /*****************************************************/
 
+        /// <summary>
+        /// 构造函数
+        /// </summary>
         public MyReadWriteLock() {
             InitializeThreadCounts();
-            fNoWaiters = true;
-            lockID = Interlocked.Increment(ref s_nextLockID);
+            flag_no_waiters = true;
+            lock_id = Interlocked.Increment(ref lock_id_incrementor);
         }
 
+        /// <summary>
+        /// 初始化锁的线程计数
+        /// </summary>
         private void InitializeThreadCounts() {
-            upgradeLockOwnerId = -1;
-            writeLockOwnerId = -1;
+            upgrade_lock_thread_id = -1;
+            write_lock_thread_id = -1;
         }
 
 
         /****************** read lock **********************/
+        /// <summary>
+        /// 不设超时时限地请求获取读锁
+        /// </summary>
         public void EnterReadLock() {
             TryEnterReadLock(-1);
         }
 
-        public bool TryEnterReadLock(int millisecondsTimeout) {
-            return TryEnterReadLock(new TimeoutTracker(millisecondsTimeout));
+        /// <summary>
+        /// 尝试在规定超时时限内请求获取读锁
+        /// </summary>
+        /// <param name="ms_timeout">超时时限</param>
+        /// <returns>是否成功</returns>
+        public bool TryEnterReadLock(int ms_timeout) {
+            return TryEnterReadLock(new TimeoutTracker(ms_timeout));
         }
 
         private bool TryEnterReadLock(TimeoutTracker timeout) {
@@ -129,98 +169,112 @@ namespace MyReadWriteLock {
             return result;
         }
 
+        /// <summary>
+        /// 请求读锁核心逻辑
+        /// </summary>
+        /// <param name="timeout"></param>
+        /// <returns></returns>
         private bool TryEnterReadLockCore(TimeoutTracker timeout) {
 
             ThreadLockNode thread_lock_node = null;
             int id = Thread.CurrentThread.ManagedThreadId;
 
-            if (id == writeLockOwnerId) {
-                //Check for AW->AR  
+            if (id == write_lock_thread_id) {
+                // 不允许读锁直接降级为写锁
                 throw new Exception("Not allow read after write");
             }
-            EnterMyLock();
-            thread_lock_node = GetThreadRWCount(false);
+            EnterInterSpanLock();
+            thread_lock_node = GetThreadLockNode(false);
 
-            //Check if the reader lock is already acquired. Note, we could check the presence of a reader by not allocating rwc (But that would lead to two lookups in the common case. It's better to keep a count in the struucture).  
             if (thread_lock_node.status == ThreadLockStatus.READING) {
-                ExitMyLock();
+                // 已有读锁，不允许重入
+                ExitInterSpanLock();
                 throw new Exception("Not allow recursive read");
             }
-            else if (id == upgradeLockOwnerId) {
-                //The upgrade lock is already held.Update the global read counts and exit.  
-                // 降级，可以直接拿到锁
+            else if (id == upgrade_lock_thread_id) {
+                // 以获取可升级读锁的线程请求普通读锁，可以直接拿到锁（不会释放原来的可升级读锁）
                 thread_lock_node.status = ThreadLockStatus.READING;
-                owners++;
-                ExitMyLock();
+                thread_count++;
+                ExitInterSpanLock();
                 return true;
             }
 
-            bool retVal = true;
-            int spincount = 0;
+            bool return_value = true;
+            int spin_count = 0;
 
             for (; ; ) {
-                // We can enter a read lock if there are only read-locks have been given out and a writer is not trying to get in.  
-                if (owners < MAX_READER) {
-                    // Good case, there is no contention, we are basically done  
-                    owners++; // Indicate we have another reader  
+                // 正常获取读锁
+                if (thread_count < MAX_READER) {
+                    thread_count++;
                     thread_lock_node.status = ThreadLockStatus.READING;
                     break;
                 }
 
-                if (spincount < MaxSpinCount) {
-                    ExitMyLock();
+                // 自旋等待
+                if (spin_count < Maxspin_count) {
+                    ExitInterSpanLock();
                     if (timeout.IsExpired)
                         return false;
-                    spincount++;
-                    Thread.SpinWait(spincount);
-                    EnterMyLock();
-                    //The per-thread structure may have been recycled as the lock is acquired (due to message pumping), load again.  
+                    spin_count++;
+                    Thread.SpinWait(spin_count);
+                    EnterInterSpanLock();
                     if (IsRwHashEntryChanged(thread_lock_node))
-                        thread_lock_node = GetThreadRWCount(false);
+                        thread_lock_node = GetThreadLockNode(false);
                     continue;
                 }
 
-                // Drat, we need to wait.  Mark that we have waiters and wait.  
-                if (readEvent == null) // Create the needed event  
+                // 设置 ManualResetEvent 等待 
+                if (readEvent == null)  
                 {
                     LazyCreateEvent(ref readEvent, false);
                     if (IsRwHashEntryChanged(thread_lock_node))
-                        thread_lock_node = GetThreadRWCount(false);
-                    continue; // since we left the lock, start over.  
+                        thread_lock_node = GetThreadLockNode(false);
+                    continue; 
                 }
-
-                retVal = WaitOnEvent(readEvent, ref numReadWaiters, timeout);
-                if (!retVal) {
+                return_value = WaitOnEvent(readEvent, ref numReadWaiters, timeout);
+                if (!return_value) {
                     return false;
                 }
                 if (IsRwHashEntryChanged(thread_lock_node))
-                    thread_lock_node = GetThreadRWCount(false);
+                    thread_lock_node = GetThreadLockNode(false);
             }
 
-            ExitMyLock();
-            return retVal;
+            ExitInterSpanLock();
+            return return_value;
         }
 
+        /// <summary>
+        /// 释放读锁
+        /// </summary>
         public void ExitReadLock() {
-            ThreadLockNode lrwc = null;
-            EnterMyLock();
-            lrwc = GetThreadRWCount(true);
-            if (lrwc == null || lrwc.status != ThreadLockStatus.READING) {
-                ExitMyLock();
+            ThreadLockNode thread_lock_node = null;
+            EnterInterSpanLock();
+            thread_lock_node = GetThreadLockNode(true);
+            if (thread_lock_node == null || thread_lock_node.status != ThreadLockStatus.READING) {
+                ExitInterSpanLock();
                 throw new Exception("mis match read");
             }
 
-            --owners;
-            lrwc.status = ThreadLockStatus.UNLOCK;
+            --thread_count;
+            thread_lock_node.status = ThreadLockStatus.UNLOCK;
             ExitAndWakeUpAppropriateWaiters();    // 唤醒合适的waiters
         }
 
         /****************** write lock **********************/
+        /// <summary>
+        /// 不设超时时限地请求获取写锁
+        /// </summary>
         public void EnterWriteLock() {
             TryEnterWriteLock(-1);
         }
-        public bool TryEnterWriteLock(int millisecondsTimeout) {
-            return TryEnterWriteLock(new TimeoutTracker(millisecondsTimeout));
+
+        /// <summary>
+        /// 尝试在规定超时时限内请求获取写锁
+        /// </summary>
+        /// <param name="ms_timeout">超时时限</param>
+        /// <returns>是否成功</returns>
+        public bool TryEnterWriteLock(int ms_timeout) {
+            return TryEnterWriteLock(new TimeoutTracker(ms_timeout));
         }
 
         private bool TryEnterWriteLock(TimeoutTracker timeout) {
@@ -232,32 +286,37 @@ namespace MyReadWriteLock {
             return result;
         }
 
+        /// <summary>
+        /// 请求写锁核心逻辑
+        /// </summary>
+        /// <param name="timeout"></param>
+        /// <returns></returns>
         private bool TryEnterWriteLockCore(TimeoutTracker timeout) {
 
             int id = Thread.CurrentThread.ManagedThreadId;
-            ThreadLockNode lrwc;
-            bool upgradingToWrite = false;
+            ThreadLockNode thread_lock_node;
+            bool upgrading_to_write = false;
 
-            if (id == writeLockOwnerId) {      //  不允许循环重入写
-                //Check for AW->AW  
+            if (id == write_lock_thread_id) {      
+                // 以获取写锁，不允许重入
                 throw new Exception("Not allow recursive write");
             }
-            else if (id == upgradeLockOwnerId) {     // 允许可升级读锁升级为写锁
-                //AU->AW case is allowed once.  
-                upgradingToWrite = true;
+            else if (id == upgrade_lock_thread_id) {     
+                // 允许可升级读锁升级为写锁
+                upgrading_to_write = true;
             }
 
-            EnterMyLock();
-            lrwc = GetThreadRWCount(true);
+            EnterInterSpanLock();
+            thread_lock_node = GetThreadLockNode(true);
 
-            //Can't acquire write lock with reader lock held.  
-            if (lrwc != null && lrwc.status == ThreadLockStatus.READING) {
-                ExitMyLock();
+            if (thread_lock_node != null && thread_lock_node.status == ThreadLockStatus.READING) {
+                // 不允许直接从读锁升级为写锁
+                ExitInterSpanLock();
                 throw new Exception("Not allow write after read");
             }
 
-            int spincount = 0;
-            bool retVal = true;
+            int spin_count = 0;
+            bool return_value = true;
             for (; ; ) {
                 if (IsWriterAcquired()) {
                     // Good case, there is no contention, we are basically done  
@@ -267,7 +326,7 @@ namespace MyReadWriteLock {
 
                 //Check if there is just one upgrader, and no readers.Assumption: Only one thread can have the upgrade lock, so the following check will fail for all other threads that may sneak in when the upgrading thread is waiting.  
 
-                if (upgradingToWrite) {
+                if (upgrading_to_write) {
                     uint readercount = GetNumReaders();
                     if (readercount == 1) {
                         //Good case again, there is just one upgrader, and no readers.  
@@ -275,11 +334,11 @@ namespace MyReadWriteLock {
                         break;
                     }
                     else if (readercount == 2) {
-                        if (lrwc != null) {
-                            if (IsRwHashEntryChanged(lrwc))
-                                lrwc = GetThreadRWCount(false);
+                        if (thread_lock_node != null) {
+                            if (IsRwHashEntryChanged(thread_lock_node))
+                                thread_lock_node = GetThreadLockNode(false);
 
-                            if (lrwc.status == ThreadLockStatus.READING) {
+                            if (thread_lock_node.status == ThreadLockStatus.READING) {
                                 //Good case again, there is just one upgrader, and no readers.  
                                 SetWriterAcquired(); // indicate we have a writer.  
                                 break;
@@ -288,26 +347,26 @@ namespace MyReadWriteLock {
                     }
                 }
 
-                if (spincount < MaxSpinCount) {   // 在timeout内竞争等待
-                    ExitMyLock();
+                if (spin_count < Maxspin_count) {   // 在timeout内竞争等待
+                    ExitInterSpanLock();
                     if (timeout.IsExpired)
                         return false;
-                    spincount++;
-                    Thread.SpinWait(spincount);
-                    EnterMyLock();
+                    spin_count++;
+                    Thread.SpinWait(spin_count);
+                    EnterInterSpanLock();
                     continue;
                 }
 
-                if (upgradingToWrite) {           // 可升级读升级为写，等待
+                if (upgrading_to_write) {           // 可升级读升级为写，等待
                     if (waitUpgradeEvent == null) // Create the needed event  
                     {
                         LazyCreateEvent(ref waitUpgradeEvent, true);
                         continue; // since we left the lock, start over.  
                     }
-                    retVal = WaitOnEvent(waitUpgradeEvent, ref numWriteUpgradeWaiters, timeout);
+                    return_value = WaitOnEvent(waitUpgradeEvent, ref numWriteUpgradeWaiters, timeout);
 
                     //The lock is not held in case of failure.  
-                    if (!retVal)
+                    if (!return_value)
                         return false;
                 }
                 else {                           // 写者等待
@@ -318,15 +377,15 @@ namespace MyReadWriteLock {
                         continue; // since we left the lock, start over.  
                     }
 
-                    retVal = WaitOnEvent(writeEvent, ref numWriteWaiters, timeout);
+                    return_value = WaitOnEvent(writeEvent, ref numWriteWaiters, timeout);
                     //The lock is not held in case of failure.  
-                    if (!retVal)
+                    if (!return_value)
                         return false;
                 }
             }
 
-            ExitMyLock();
-            writeLockOwnerId = id;
+            ExitInterSpanLock();
+            write_lock_thread_id = id;
             return true;
         }
 
@@ -334,32 +393,26 @@ namespace MyReadWriteLock {
 #if DEBUG
             //Console.WriteLine("Debug: ExitWriteLock");
 #endif
-            ThreadLockNode lrwc;
+            ThreadLockNode thread_lock_node;
 
-            EnterMyLock();
-            lrwc = GetThreadRWCount(false);
+            EnterInterSpanLock();
+            thread_lock_node = GetThreadLockNode(false);
 
-            if (lrwc == null) {
-                ExitMyLock();
+            if (thread_lock_node == null) {
+                ExitInterSpanLock();
                 throw new Exception("Mis match write");
             }
 
+            thread_lock_node.status = ThreadLockStatus.UNLOCK;
 
-            //if (thread_lock_node.writercount < 1) {       // for recursive write
-            //    ExitMyLock();
-            //    throw new Exception("Mis match write");
-            //}
-
-            lrwc.status = ThreadLockStatus.UNLOCK;
-
-            if (lrwc.status == ThreadLockStatus.WRITING) {
-                ExitMyLock();
+            if (thread_lock_node.status == ThreadLockStatus.WRITING) {
+                ExitInterSpanLock();
                 return;
             }
 
             ClearWriterAcquired();
 
-            writeLockOwnerId = -1;
+            write_lock_thread_id = -1;
 
             ExitAndWakeUpAppropriateWaiters();  // 唤醒
         }
@@ -369,8 +422,8 @@ namespace MyReadWriteLock {
             TryEnterUpgradeableReadLock(-1);
         }
 
-        public bool TryEnterUpgradeableReadLock(int millisecondsTimeout) {
-            return TryEnterUpgradeableReadLock(new TimeoutTracker(millisecondsTimeout));
+        public bool TryEnterUpgradeableReadLock(int ms_timeout) {
+            return TryEnterUpgradeableReadLock(new TimeoutTracker(ms_timeout));
         }
 
         private bool TryEnterUpgradeableReadLock(TimeoutTracker timeout) {
@@ -385,45 +438,45 @@ namespace MyReadWriteLock {
         private bool TryEnterUpgradeableReadLockCore(TimeoutTracker timeout) {
 
             int id = Thread.CurrentThread.ManagedThreadId;
-            ThreadLockNode lrwc;
+            ThreadLockNode thread_lock_node;
 
-            if (id == upgradeLockOwnerId) {
+            if (id == upgrade_lock_thread_id) {
                 //Check for AU->AU  
                 throw new Exception("Not allow recursive upgrade");
             }
-            else if (id == writeLockOwnerId) {
+            else if (id == write_lock_thread_id) {
                 //Check for AU->AW  
                 throw new Exception("Not allow upgrade after write");
             }
 
-            EnterMyLock();
-            lrwc = GetThreadRWCount(true);
+            EnterInterSpanLock();
+            thread_lock_node = GetThreadLockNode(true);
             //Can't acquire upgrade lock with reader lock held.  
-            if (lrwc != null && lrwc.status == ThreadLockStatus.READING) {
-                ExitMyLock();
+            if (thread_lock_node != null && thread_lock_node.status == ThreadLockStatus.READING) {
+                ExitInterSpanLock();
                 throw new Exception("Not allow upgrade after read");
             }
 
-            bool retVal = true;
-            int spincount = 0;
+            bool return_value = true;
+            int spin_count = 0;
 
             for (; ; ) {
                 //Once an upgrade lock is taken, it's like having a reader lock held  
                 //until upgrade or downgrade operations are performed.  
 
-                if ((upgradeLockOwnerId == -1) && (owners < MAX_READER)) {
-                    owners++;
-                    upgradeLockOwnerId = id;
+                if ((upgrade_lock_thread_id == -1) && (thread_count < MAX_READER)) {
+                    thread_count++;
+                    upgrade_lock_thread_id = id;
                     break;
                 }
 
-                if (spincount < MaxSpinCount) {
-                    ExitMyLock();
+                if (spin_count < Maxspin_count) {
+                    ExitInterSpanLock();
                     if (timeout.IsExpired)
                         return false;
-                    spincount++;
-                    Thread.SpinWait(spincount);
-                    EnterMyLock();
+                    spin_count++;
+                    Thread.SpinWait(spin_count);
+                    EnterInterSpanLock();
                     continue;
                 }
 
@@ -435,26 +488,26 @@ namespace MyReadWriteLock {
                 }
 
                 //Only one thread with the upgrade lock held can proceed.  
-                retVal = WaitOnEvent(upgradeEvent, ref numUpgradeWaiters, timeout);
-                if (!retVal)
+                return_value = WaitOnEvent(upgradeEvent, ref numUpgradeWaiters, timeout);
+                if (!return_value)
                     return false;
             }
 
-            ExitMyLock();
+            ExitInterSpanLock();
             return true;
         }
 
         public void ExitUpgradeableReadLock() {
-            ThreadLockNode lrwc;
+            ThreadLockNode thread_lock_node;
 
-            if (Thread.CurrentThread.ManagedThreadId != upgradeLockOwnerId) {
+            if (Thread.CurrentThread.ManagedThreadId != upgrade_lock_thread_id) {
                 //You have to be holding the upgrade lock to make this call.  
                 throw new Exception("Mis match upgrade");
             }
-            EnterMyLock();
+            EnterInterSpanLock();
 
-            owners--;
-            upgradeLockOwnerId = -1;
+            thread_count--;
+            upgrade_lock_thread_id = -1;
 
             ExitAndWakeUpAppropriateWaiters();   // 唤醒
         }
@@ -466,8 +519,8 @@ namespace MyReadWriteLock {
         /// 唤醒
         /// </summary>
         private void ExitAndWakeUpAppropriateWaiters() {
-            if (fNoWaiters) {
-                ExitMyLock();
+            if (flag_no_waiters) {
+                ExitInterSpanLock();
                 return;
             }
             ExitAndWakeUpAppropriateWaitersPreferringWriters();   // 唤醒，优先唤醒写者
@@ -483,11 +536,11 @@ namespace MyReadWriteLock {
 
             if (readercount == 1 && numWriteUpgradeWaiters > 0) {  // 只有一个读者正在读，且这个读者待升级，则让这个读者升级
                 //We have to be careful now, as we are droppping the lock. No new writes should be allowed to sneak in if an upgrade was pending.  
-                ExitMyLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
+                ExitInterSpanLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
                 waitUpgradeEvent.Set(); // release all upgraders (however there can be at most one).  
             }
             else if (readercount == 0 && numWriteWaiters > 0) {    // 没有读者在读了，但有等待的写者，则释放一个写者
-                ExitMyLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
+                ExitInterSpanLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
                 writeEvent.Set(); // release one writer.  
             }
             else if (readercount >= 0) {                           // 正在读的读者 >= 0
@@ -495,11 +548,11 @@ namespace MyReadWriteLock {
                     if (numReadWaiters != 0)                            // 有等待的普通读者，释放读者
                         setReadEvent = true;
 
-                    if (numUpgradeWaiters != 0 && upgradeLockOwnerId == -1) {   // 如果有等待的可升级读者，且暂时没有可升级读者在读
+                    if (numUpgradeWaiters != 0 && upgrade_lock_thread_id == -1) {   // 如果有等待的可升级读者，且暂时没有可升级读者在读
                         setUpgradeEvent = true;
                     }
 
-                    ExitMyLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
+                    ExitInterSpanLock(); // Exit before signaling to improve efficiency (wakee will need the lock)  
 
                     if (setReadEvent)
                         readEvent.Set(); // release all readers.    // 释放所有普通读者
@@ -508,13 +561,13 @@ namespace MyReadWriteLock {
                         upgradeEvent.Set(); //release one upgrader.   // 释放一个可升级读者
                 }
                 else
-                    ExitMyLock();
+                    ExitInterSpanLock();
             }
             else
-                ExitMyLock();
+                ExitInterSpanLock();
         }
 
-        private void EnterMyLock() {
+        private void EnterInterSpanLock() {
             if (Interlocked.CompareExchange(ref inter_span_lock, 1, 0) != 0)
                 EnterMyLockSpin();
         }
@@ -522,11 +575,11 @@ namespace MyReadWriteLock {
         private void EnterMyLockSpin() {
             int pc = Environment.ProcessorCount;   // 当前处理器的数量
             for (int i = 0; ; i++) {
-                if (i < LockSpinCount && pc > 1) {
+                if (i < Lockspin_count && pc > 1) {
                     // 等待几十条指令，让另一个处理器释放锁
                     Thread.SpinWait(LockSpinCycles * (i + 1)); // Wait a few dozen instructions to let another processor release lock.  
                 }
-                else if (i < (LockSpinCount + LockSleep0Count)) {
+                else if (i < (Lockspin_count + LockSleep0Count)) {
                     Thread.Sleep(0); // Give up my quantum.  
                 }
                 else {
@@ -538,17 +591,17 @@ namespace MyReadWriteLock {
             }
         }
 
-        private void ExitMyLock() {
+        private void ExitInterSpanLock() {
             Debug.Assert(inter_span_lock != 0, "Exiting spin lock that is not held");
             Volatile.Write(ref inter_span_lock, 0);
         }
 
         /// DontAllocate is set to true if the caller just wants to get an existing entry for this thread, but doesn't want to add one if an existing one could not be found.  
-        private ThreadLockNode GetThreadRWCount(bool dontAllocate) {
-            ThreadLockNode rwc = t_rwc;
+        private ThreadLockNode GetThreadLockNode(bool dontAllocate) {
+            ThreadLockNode rwc = thread_tln;
             ThreadLockNode empty = null;
             while (rwc != null) {
-                if (rwc.lock_id == this.lockID)
+                if (rwc.lock_id == this.lock_id)
                     return rwc;
 
                 if (!dontAllocate && empty == null && IsRWEntryEmpty(rwc))
@@ -562,11 +615,11 @@ namespace MyReadWriteLock {
 
             if (empty == null) {
                 empty = new ThreadLockNode();
-                empty.next = t_rwc;
-                t_rwc = empty;
+                empty.next = thread_tln;
+                thread_tln = empty;
             }
 
-            empty.lock_id = this.lockID;
+            empty.lock_id = this.lock_id;
             return empty;
         }
 
@@ -580,13 +633,13 @@ namespace MyReadWriteLock {
         }
 
         private void LazyCreateEvent(ref EventWaitHandle waitEvent, bool makeAutoResetEvent) {
-            ExitMyLock();
+            ExitInterSpanLock();
             EventWaitHandle newEvent;
             if (makeAutoResetEvent)
                 newEvent = new AutoResetEvent(false);
             else
                 newEvent = new ManualResetEvent(false);
-            EnterMyLock();
+            EnterInterSpanLock();
             if (waitEvent == null) // maybe someone snuck in.  
                 waitEvent = newEvent;
             else
@@ -596,7 +649,7 @@ namespace MyReadWriteLock {
         private bool WaitOnEvent(EventWaitHandle waitEvent, ref uint numWaiters, TimeoutTracker timeout) {
             waitEvent.Reset();
             numWaiters++;
-            fNoWaiters = false;
+            flag_no_waiters = false;
 
             //Setting these bits will prevent new readers from getting in.  
             if (numWriteWaiters == 1)
@@ -605,17 +658,17 @@ namespace MyReadWriteLock {
                 SetUpgraderWaiting();
 
             bool waitSuccessful = false;
-            ExitMyLock(); // Do the wait outside of any lock  
+            ExitInterSpanLock(); // Do the wait outside of any lock  
 
             try {
                 waitSuccessful = waitEvent.WaitOne(timeout.RemainingMilliseconds);
             }
             finally {
-                EnterMyLock();
+                EnterInterSpanLock();
                 --numWaiters;
 
                 if (numWriteWaiters == 0 && numWriteUpgradeWaiters == 0 && numUpgradeWaiters == 0 && numReadWaiters == 0)
-                    fNoWaiters = true;
+                    flag_no_waiters = true;
 
                 if (numWriteWaiters == 0)
                     ClearWritersWaiting();
@@ -623,13 +676,13 @@ namespace MyReadWriteLock {
                     ClearUpgraderWaiting();
 
                 if (!waitSuccessful) // We may also be about to throw for some reason.  Exit inter_span_lock.  
-                    ExitMyLock();
+                    ExitInterSpanLock();
             }
             return waitSuccessful;
         }
 
-        private bool IsRwHashEntryChanged(ThreadLockNode lrwc) {
-            return lrwc.lock_id != this.lockID;
+        private bool IsRwHashEntryChanged(ThreadLockNode thread_lock_node) {
+            return thread_lock_node.lock_id != this.lock_id;
         }
 
         /// <summary>
@@ -638,35 +691,35 @@ namespace MyReadWriteLock {
         /// </summary>
         /// <returns></returns>
         private bool IsWriterAcquired() {
-            return (owners & ~WAITING_WRITERS) == 0;
+            return (thread_count & ~WAITING_WRITERS) == 0;
         }
 
         private void SetWriterAcquired() {
-            owners |= WRITER_HELD; // indicate we have a writer.
+            thread_count |= WRITER_HELD; // indicate we have a writer.
         }
 
         private void ClearWriterAcquired() {
-            owners &= ~WRITER_HELD;
+            thread_count &= ~WRITER_HELD;
         }
 
         private void SetWritersWaiting() {
-            owners |= WAITING_WRITERS;
+            thread_count |= WAITING_WRITERS;
         }
 
         private void ClearWritersWaiting() {
-            owners &= ~WAITING_WRITERS;
+            thread_count &= ~WAITING_WRITERS;
         }
 
         private void SetUpgraderWaiting() {
-            owners |= WAITING_UPGRADER;
+            thread_count |= WAITING_UPGRADER;
         }
 
         private void ClearUpgraderWaiting() {
-            owners &= ~WAITING_UPGRADER;
+            thread_count &= ~WAITING_UPGRADER;
         }
 
         private uint GetNumReaders() {
-            return owners & READER_MASK;
+            return thread_count & READER_MASK;
         }
     }
 }
