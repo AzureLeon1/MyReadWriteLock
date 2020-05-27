@@ -632,6 +632,11 @@ namespace MyReadWriteLock {
             return lrwc.lockID != this.lockID;
         }
 
+        /// <summary>
+        /// 是否允许获取写锁
+        /// 当该锁没有被任何进程获取时返回true
+        /// </summary>
+        /// <returns></returns>
         private bool IsWriterAcquired() {
             return (owners & ~WAITING_WRITERS) == 0;
         }
