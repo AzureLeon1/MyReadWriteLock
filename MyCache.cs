@@ -6,8 +6,17 @@ using System.Threading;
 using System.Threading.Tasks;
 
 namespace MyReadWriteLock {
+
+    /// <summary>
+    /// 使用读写锁实现的一个共享缓存
+    /// </summary>
     public class MyCache {
-        private ReaderWriterLockSlim cacheLock = new ReaderWriterLockSlim();
+        // private ReaderWriterLockSlim cacheLock = new ReaderWriterLockSlim();
+        private MyReadWriteLock cacheLock = new MyReadWriteLock();
+
+        /// <summary>
+        /// 共享资源对象：一个字典
+        /// </summary>
         private Dictionary<int, string> innerCache = new Dictionary<int, string>();
 
         public int Count { get { return innerCache.Count; } }
@@ -99,7 +108,7 @@ namespace MyReadWriteLock {
         };
 
         ~MyCache() {
-            if (cacheLock != null) cacheLock.Dispose();
+            // if (cacheLock != null) cacheLock.Dispose();
         }
     }
 }
