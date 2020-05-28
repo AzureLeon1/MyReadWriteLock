@@ -69,7 +69,7 @@ namespace MyReadWriteLock {
         int inter_span_lock;
 
         // 自旋行为
-        const int Lockspin_count = 10;    // 自旋次数
+        const int LockSpinCount = 10;    // 自旋次数
         const int LockSpinCycles = 20;   // 自旋圈数
         const int LockSleep0Count = 5;   // sleep(0)次数
         /************************************************************/
@@ -590,19 +590,19 @@ namespace MyReadWriteLock {
         /// </summary>
         private void EnterInterSpanLock() {
             if (Interlocked.CompareExchange(ref inter_span_lock, 1, 0) != 0)
-                EnterMyLockSpin();
+                EnterInterLockSpin();
         }
 
         /// <summary>
         /// 如果不能马上获取内部自旋锁，则采取以下策略不断尝试获取：自旋多次 -> sleep(0)多次 -> sleep(1)多次
         /// </summary>
-        private void EnterMyLockSpin() {
+        private void EnterInterLockSpin() {
             int pc = Environment.ProcessorCount;   // 当前处理器的数量
             for (int i = 0; ; i++) {
-                if (i < Lockspin_count && pc > 1) {
+                if (i < LockSpinCount && pc > 1) {
                     Thread.SpinWait(LockSpinCycles * (i + 1)); 
                 }
-                else if (i < (Lockspin_count + LockSleep0Count)) {
+                else if (i < (LockSpinCount + LockSleep0Count)) {
                     Thread.Sleep(0); 
                 }
                 else {

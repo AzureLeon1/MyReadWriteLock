@@ -23,24 +23,24 @@ namespace MyReadWriteLock {
 
         public string Read(int key) {
             cacheLock.EnterReadLock();
-            Console.WriteLine("请求读锁成功！");
+            Console.WriteLine("* LockInfo: 请求读锁成功！");
             try {
                 return innerCache[key];
             }
             finally {
-                Console.WriteLine("退出读锁！");
+                Console.WriteLine("* LockInfo: 退出读锁！");
                 cacheLock.ExitReadLock();
             }
         }
 
         public void Add(int key, string value) {
             cacheLock.EnterWriteLock();
-            Console.WriteLine("请求写锁成功！");
+            Console.WriteLine("* LockInfo: 请求写锁成功！");
             try {
                 innerCache.Add(key, value);
             }
             finally {
-                Console.WriteLine("退出写锁！");
+                Console.WriteLine("* LockInfo: 退出写锁！");
                 cacheLock.ExitWriteLock();
             }
         }
@@ -62,7 +62,7 @@ namespace MyReadWriteLock {
 
         public AddOrUpdateStatus AddOrUpdate(int key, string value) {
             cacheLock.EnterUpgradeableReadLock();
-            Console.WriteLine("请求可升级读锁成功！");
+            Console.WriteLine("* LockInfo: 请求可升级读锁成功！");
             try {
                 string result = null;
                 if (innerCache.TryGetValue(key, out result)) {
@@ -71,12 +71,12 @@ namespace MyReadWriteLock {
                     }
                     else {
                         cacheLock.EnterWriteLock();
-                        Console.WriteLine("请求写锁成功！");
+                        Console.WriteLine("* LockInfo: 请求写锁成功！");
                         try {
                             innerCache[key] = value;
                         }
                         finally {
-                            Console.WriteLine("退出写锁！");
+                            Console.WriteLine("* LockInfo: 退出写锁！");
                             cacheLock.ExitWriteLock();
                         }
                         return AddOrUpdateStatus.Updated;
@@ -84,31 +84,31 @@ namespace MyReadWriteLock {
                 }
                 else {
                     cacheLock.EnterWriteLock();
-                    Console.WriteLine("请求写锁成功！");
+                    Console.WriteLine("* LockInfo: 请求写锁成功！");
                     try {
                         innerCache.Add(key, value);
                     }
                     finally {
-                        Console.WriteLine("退出写锁！");
+                        Console.WriteLine("* LockInfo: 退出写锁！");
                         cacheLock.ExitWriteLock();
                     }
                     return AddOrUpdateStatus.Added;
                 }
             }
             finally {
-                Console.WriteLine("退出可升级读锁！");
+                Console.WriteLine("* LockInfo: 退出可升级读锁！");
                 cacheLock.ExitUpgradeableReadLock();
             }
         }
 
         public void Delete(int key) {
             cacheLock.EnterWriteLock();
-            Console.WriteLine("请求写锁成功！");
+            Console.WriteLine("* LockInfo: 请求写锁成功！");
             try {
                 innerCache.Remove(key);
             }
             finally {
-                Console.WriteLine("退出写锁！");
+                Console.WriteLine("* LockInfo: 退出写锁！");
                 cacheLock.ExitWriteLock();
             }
         }
